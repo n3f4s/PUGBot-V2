@@ -31,7 +31,7 @@ package Bot {
     val red: String
   ) {
     def validate(client: GatewayDiscordClient): Lobby = {
-      val guild_t = client.getGuildById(Snowflake.of(guild)).block
+      val guild_t = (client getGuildById Snowflake.of(guild) block)
       Lobby(
         name,
         guild_t.getChannelById(Snowflake.of(waiting)).block.asInstanceOf[VoiceChannel],
@@ -59,6 +59,8 @@ package Bot {
       private val red_to_lobby: Map[Snowflake, Lobby] = Map()
       private val blue_to_lobby: Map[Snowflake, Lobby] = Map()
 
+      def list_lobbies = lobbies.values
+
       def add_lobby(lobby: Lobby) = {
         lobbies += (lobby.name -> lobby)
         lobbies_set += lobby.waiting.getId
@@ -70,7 +72,7 @@ package Bot {
       }
       def get_lobby(name: String): Option[Lobby] = lobbies.get(name)
       def remove_lobby(name: String) = {
-        lobbies.get(name) match {
+        (lobbies get name) match {
           case None ⇒ {}
           case Some(lobby) ⇒ {
             lobbies -= name
@@ -85,16 +87,16 @@ package Bot {
         }
       }
       def get_by_waiting_id(id: Snowflake): Option[Lobby] = {
-        waiting_to_lobby.get(id)
+        waiting_to_lobby get id
       }
       def get_by_red_id(id: Snowflake): Option[Lobby] = {
-        red_to_lobby.get(id)
+        red_to_lobby get id
       }
       def get_by_blue_id(id: Snowflake): Option[Lobby] = {
-        blue_to_lobby.get(id)
+        blue_to_lobby get id
       }
       def is_pug_chan(id: Snowflake): Boolean = {
-        lobbies_set.contains(id)
+        lobbies_set contains id
       }
       def to_str = lobbies.values.map(_.to_str).mkString("\n")
       def to_json = {

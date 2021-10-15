@@ -14,8 +14,6 @@ import discord4j.core.event.ReactiveEventAdapter
 import reactor.core.publisher.Mono
 import discord4j.core.event.domain.interaction.ChatInputInteractionEvent
 
-import discord4j.rest.util.ApplicationCommandOptionType
-
 import collection.JavaConverters._
 import reactor.core.scala.publisher._
 import reactor.core.scala.publisher.ScalaConverters._
@@ -27,6 +25,16 @@ import org.slf4j.LoggerFactory
 import scala.collection.mutable
 import discord4j.common.util.Snowflake
 import discord4j.core.`object`.entity.channel.PrivateChannel
+import akka.pattern.StatusReply.Success
+import scala.util.{ Failure, Success => TSuccess }
+import discord4j.core.`object`.command.ApplicationCommandOption
+
+import Bot.SlashCmd.{
+  given_Conversion_GatewayDiscordClient_Client2SlashBuilder,
+  given_Conversion_SlashCommandBuilder_SlashCommandReg,
+  given_Conversion_ArgumentBuilder_Argument,
+  given_Conversion_String_ArgumentBuilder,
+}
 
 
 package Bot{
@@ -36,8 +44,13 @@ package Bot{
         vs.getChannelId.map(id ⇒ l.waiting.getId == id
                               || l.red.getId == id
                               || l.blue.getId == id).getOrElse(false)
-      val from_lobby = status.getOld.flatMap(_.getChannelId).map(id ⇒ lobbies.is_pug_chan(id)).getOrElse(false)
-      val to_lobby = status.getCurrent.getChannelId.map(id ⇒ lobbies.is_pug_chan(id)).getOrElse(false)
+      val from_lobby = ((status.getOld)
+                          flatMap (_.getChannelId)
+                          map (id ⇒ lobbies is_pug_chan id)
+                          getOrElse false)
+      val to_lobby = ((status.getCurrent.getChannelId)
+                        map (id ⇒ lobbies is_pug_chan id)
+                        getOrElse false)
       if (status.isLeaveEvent && from_lobby) Leave(status.getOld.get)
       else if (status.isMoveEvent && from_lobby && !to_lobby) Leave(status.getOld.get)
       else if (status.isMoveEvent && from_lobby && to_lobby) Move(status.getOld.get, status.getCurrent)
@@ -55,33 +68,25 @@ package Bot{
 
   object Bot {
     private val logger = LoggerFactory.getLogger("DiscordBot")
-    def reply(evt: ChatInputInteractionEvent, lobbies: Lobbies): Mono[Void] = {
+    def reply(evt: ChatInputInteractionEvent, lobbies: Lobbies): Mono[Option[Lobby]] = {
       implicit class J2SOpt[T](val x: java.util.Optional[T]) {
         def toScala = if(x.isPresent) { Some(x.get) } else { None }
       }
       def get_chan(evt: ChatInputInteractionEvent, name: String): Channel = {
-        evt
-          .getInteraction()
-          .getCommandInteraction()
-          .toScala
-          .flatMap(_.getOption(name).toScala)
-          .flatMap(_.getValue.toScala)
-          .map(_.asChannel().block)
-          .get
+        ((evt.getInteraction.getCommandInteraction.toScala)
+           flatMap (_.getOption(name).toScala)
+           flatMap (_.getValue.toScala)
+           map (_.asChannel().block)
+           get)
       }
-      val lobby_name = evt
-        .getInteraction()
-        .getCommandInteraction()
-        .toScala
-        .flatMap(_.getOption("lobby_name").toScala)
-        .flatMap(_.getValue.toScala)
-        .map(_.asString())
-        .get
+      val lobby_name = ((evt.getInteraction.getCommandInteraction.toScala)
+                          .flatMap(_.getOption("lobby_name").toScala)
+                          .flatMap(_.getValue.toScala)
+                          .map(_.asString())
+                          .get)
       val waiting_room = get_chan(evt, "waiting_room")
       val red_room = get_chan(evt, "red_team")
       val blue_room = get_chan(evt, "blue_team")
-      // FIXME: add names of bad channel
-      // TODO: add in the pug bot
       val res = (waiting_room, blue_room, red_room) match {
         case (w: VoiceChannel, b: VoiceChannel, r: VoiceChannel) ⇒ {
           val waiting_room = w.getName
@@ -118,14 +123,14 @@ package Bot{
           "None of the channels are voice channels"
         }
       }
-      evt.reply(res)
+      evt reply res `then` Mono.just(lobbies get_lobby lobby_name)
     }
 
     def save_d2b(d2b: mutable.Set[Snowflake], filename: String) = {
       import java.io._
-      val content = d2b.map(_.asString).mkString(",")
+      val content = d2b map (_.asString) mkString ","
       val pw = new PrintWriter(new File(filename))
-      pw.write(content)
+      pw write content
       pw.close
     }
     def load_d2b(filename: String): mutable.Set[Snowflake] = {
@@ -142,18 +147,21 @@ package Bot{
       }
     }
     def register_btag(msg: Message, d2b: mutable.Set[Snowflake]) = {
-      // FIXME: error handling
+      import Overwatch.BattleTag
       val user = msg.getAuthor.get
       val id = user.getId
-      val btag = Overwatch.BattleTag.from_string(msg.getContent).get
-      d2b += id
-      save_d2b(d2b, "reg_users")
-      (user, btag)
+      (BattleTag
+         from_string msg.getContent
+         map { btag =>
+           d2b += id
+           save_d2b(d2b, "reg_users")
+           Right( (user, btag) )
+         }
+         getOrElse Left(user))
     }
 
     def apply(ref: ActorRef[ActorMessage]): Behavior[ActorMessage] = {
 
-      // FIXME: Error handling
       Behaviors.setup { context ⇒
         implicit class J2SOpt[T](val x: java.util.Optional[T]) {
           def toScala = if(x.isPresent) { Some(x.get) } else { None }
@@ -163,94 +171,90 @@ package Bot{
 
         val token = sys.env("DISCORD_PUG_BOT")
 
-        val client: GatewayDiscordClient = (DiscordClient.create(token).login().block())
+        val client: GatewayDiscordClient = DiscordClient.create(token).login.block
+        ref ! ActorMessage.TriggerLoad(client)
 
         logger.debug("Client started")
 
         val lobbies = if (new java.io.File("lobbies.json").exists) {
           logger.info("Reading from file")
-          Lobbies.from_json(Source.fromFile("lobbies.json").getLines.mkString, client)
+          Lobbies.from_json(Source.fromFile("lobbies.json") .getLines.mkString, client)
         } else {
           logger.warn("No config found")
           Lobbies()
         }
+        lobbies.list_lobbies.foreach {l => ActorMessage.NewLobby(l)}
 
         logger.debug("Lobbies created")
 
         def get_lobby(vs: VoiceState): Lobby =
           (lobbies
-             get_by_waiting_id (vs.getChannelId.get)
-             orElse (lobbies get_by_red_id (vs.getChannelId.get))
-             orElse (lobbies get_by_blue_id (vs.getChannelId.get))
-             get
+             .get_by_waiting_id(vs.getChannelId.get)
+             .orElse(lobbies.get_by_red_id(vs.getChannelId.get))
+             .orElse(lobbies.get_by_blue_id(vs.getChannelId.get))
+             .get
           )
 
-        val rest_client = client.getRestClient
-        val app_id = rest_client.getApplicationId.block
-        val conf_cmd = (ApplicationCommandRequest.builder()
-                          .name ("addlobby")
-                          .description ("Register three voice channel as PUG voice channel (a lobby and two team voice channel)")
-                          .addOption(ApplicationCommandOptionData.builder()
-                                       .name("lobby_name")
-                                       .description("Lobby name")
-                                       .`type`(ApplicationCommandOptionType.STRING.getValue())
-                                       .required(true)
-                                       .build())
-                          .addOption(ApplicationCommandOptionData.builder()
-                                       .name("waiting_room")
-                                       .description("Lobby's voice channel")
-                                       .`type`(ApplicationCommandOptionType.CHANNEL.getValue())
-                                       .required(true)
-                                       .build())
-                          .addOption(ApplicationCommandOptionData.builder()
-                                       .name("red_team")
-                                       .description("Red team's voice channel")
-                                       .`type`(ApplicationCommandOptionType.CHANNEL.getValue())
-                                       .required(true)
-                                       .build())
-                          .addOption(ApplicationCommandOptionData.builder()
-                                       .name("blue_team")
-                                       .description("Blue team's voice channel")
-                                       .`type`(ApplicationCommandOptionType.CHANNEL.getValue())
-                                       .required(true)
-                                       .build())
-                          .build)
-        val print_cmd = (ApplicationCommandRequest.builder()
-                           .name ("printcfg")
-                           .description ("Print the configuration for this server")
-                           .build)
-        logger.debug("Command created")
+        val print_cmd = (client / "printcfg"
+                           desc "Print the configuration for this server"
+                           executing {evt =>
+                             logger.info("Got command print cfg")
+                             logger.debug(lobbies.to_str)
+                             evt.reply("__**_Lobbies_**__:\n" + lobbies.to_str)
+                           }
+                           register_guild 823930184067579954L) match {
+          case TSuccess(f) => f
+          case Failure(t) => throw t
+        }
 
-        ((rest_client.getApplicationService)
-           createGuildApplicationCommand (app_id, 823930184067579954L, conf_cmd)
-           doOnError (err ⇒ logger.error(s"Can't create command: ${err}"))
-           onErrorResume (e ⇒ Mono.empty())
-           block)
-        ((rest_client.getApplicationService)
-           createGuildApplicationCommand (app_id, 823930184067579954L, print_cmd)
-           doOnError (err ⇒ logger.error(s"Can't create command: ${err}"))
-           onErrorResume (e ⇒ Mono.empty())
-           block)
-        logger.debug("Command registered")
+        val db_debug_cmd = (client / "dbdebug"
+                              desc "Print debug data from the database"
+                              executing {evt =>
+                                evt.acknowledge.block
+                                ref ! ActorMessage.DebugReqMsg(evt)
+                                Mono.empty}
+                              register_guild 823930184067579954L) match {
+          case TSuccess(f) => f
+          case Failure(t) => throw t
+        }
+
+        import SlashCmd.Arguments
+        import SlashCmd.Arguments.Channel
+        val conf_cmd =
+          (client / "addlobby"
+             -- ("lobby_name"  desc "Lobby name" of_type Arguments.Type.String is_required true)
+             -- ("waiting_room" desc "Lobby's voice channel" of_type Arguments.Type.Channel(Channel.Type.GuildVoice) is_required true)
+             -- ("red_team" desc "Read team's voice channel" of_type Arguments.Type.Channel(Channel.Type.GuildVoice) is_required true)
+             -- ("blue_team" desc "Blue team's voice channel" of_type Arguments.Type.Channel(Channel.Type.GuildVoice) is_required true)
+             desc "Register three voice channel as PUG voice channel (a lobby and two team voice channel)"
+             executing { evt =>
+               logger info "Got command add lobby"
+               (Bot reply (evt, lobbies)
+                  doOnNext (_ foreach (l => ref ! ActorMessage.NewLobby(l)))
+                  `then`)
+             }
+             register_guild 823930184067579954L) match {
+            case TSuccess(f) => f
+            case Failure(t) => throw t
+          }
+        logger debug "Command created"
+        logger debug "Command registered"
 
         ((client.getEventDispatcher) on classOf[ReadyEvent]
           subscribe(ready => logger.info("Logged in as " + ready.getSelf().getUsername())))
 
-        (client on classOf[ChatInputInteractionEvent]
-           filter (evt ⇒ Array("addlobby", "printcfg") contains evt.getCommandName)
-           flatMap (evt ⇒
-             if (evt.getCommandName == "addlobby") {
-               logger.info("Got command add lobby")
-               Bot.reply(evt, lobbies)
-             }
-             else if(evt.getCommandName == "printcfg") {
-               logger.info("Got command print cfg")
-               logger.debug(lobbies.to_str)
-               evt.reply("__**_Lobbies_**__:\n" + lobbies.to_str)
-             }
-             else {Mono.empty()})
-           subscribe
-        )
+        client.on(classOf[ChatInputInteractionEvent])
+          .filter(evt ⇒ Array("addlobby", "printcfg",  "dbdebug").contains(evt.getCommandName))
+          .flatMap(evt ⇒
+            if (evt.getCommandName == "addlobby") {
+              conf_cmd(evt)
+            } else if(evt.getCommandName == "printcfg") {
+              print_cmd(evt)
+            } else if(evt.getCommandName == "dbdebug") {
+              db_debug_cmd(evt)
+            }
+            else {Mono.empty()})
+          .subscribe
 
         val disc2btag: mutable.Set[Snowflake] = load_d2b("reg_users")
         (client on classOf[MessageCreateEvent]
@@ -259,7 +263,18 @@ package Bot{
            filter (message ⇒ !message.getContent.isEmpty)
            filterWhen (_.getChannel.map(_.isInstanceOf[PrivateChannel]))
            map (msg => register_btag(msg, disc2btag))
-           doOnNext { (user, btag) => ref ! ActorMessage.RegisterPlayer(user, btag, Sender.Bot) }
+           doOnNext { res => res match {
+                       case Right((user, btag)) => {
+                         logger.info(s"New battle tag ${btag.full} for user ${user.getUsername}")
+                         ref ! ActorMessage.RegisterPlayer(user, btag, Sender.Bot)
+                       }
+                       case Left(user) => {
+                         logger.info(s"No battle tag found in DM from ${user.getUsername}")
+                         user.getPrivateChannel
+                           .flatMap(_ createMessage "No battle tag found")
+                           .block
+                       }
+                     }}
            subscribe
         )
 
@@ -288,8 +303,12 @@ package Bot{
                val lobby_f = get_lobby(from)
                val lobby_t = get_lobby(to)
                logger.info(s"Player ${user.getUsername} joined lobby ${lobby_f.name} and left ${lobby_t.name}")
-               ref ! ActorMessage.PlayerJoinLobby(user, lobby_t.name, Sender.Bot)
-               ref ! ActorMessage.PlayerLeaveLobby(user, lobby_f.name, Sender.Bot)
+               if (lobby_t.name == lobby_f.name) {
+                 // TODO
+               } else {
+                 ref ! ActorMessage.PlayerJoinLobby(user, lobby_t.name, Sender.Bot)
+                 ref ! ActorMessage.PlayerLeaveLobby(user, lobby_f.name, Sender.Bot)
+               }
              }
              case VoiceChange.NOOP ⇒ {}}
            subscribe
